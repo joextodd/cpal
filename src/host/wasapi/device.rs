@@ -248,8 +248,8 @@ unsafe fn format_from_waveformatex_ptr(
         (a.data1, a.data2, a.data3, a.data4) == (b.data1, b.data2, b.data3, b.data4)
     }
     let sample_format = match (
-        (*waveformatex_ptr).wBitsPerSample,
-        (*waveformatex_ptr).wFormatTag as u32,
+        (*waveformatex_ptr).wBitsPerSample, // 8 or 16 for integers, 32 for floats
+        (*waveformatex_ptr).wFormatTag,
     ) {
         (16, Audio::WAVE_FORMAT_PCM) => SampleFormat::I16,
         (32, Multimedia::WAVE_FORMAT_IEEE_FLOAT) => SampleFormat::F32,
