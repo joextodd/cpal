@@ -1015,7 +1015,7 @@ fn config_to_waveformatextensible(
     let format_tag = match sample_format {
         SampleFormat::I16 => Audio::WAVE_FORMAT_PCM,
         SampleFormat::F32 => KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
-        SampleFormat::U16 => return None,
+        SampleFormat::U16 | SampleFormat::I32 => return None,
     } as u16;
     let channels = config.channels;
     let sample_rate = config.sample_rate.0;
@@ -1030,7 +1030,7 @@ fn config_to_waveformatextensible(
             let ex_size = mem::size_of::<Audio::WAVEFORMATEX>();
             (extensible_size - ex_size) as u16
         }
-        SampleFormat::U16 => return None,
+        SampleFormat::U16 | SampleFormat::I32 => return None,
     };
     let waveformatex = Audio::WAVEFORMATEX {
         wFormatTag: format_tag,
