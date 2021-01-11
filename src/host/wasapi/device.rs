@@ -1048,7 +1048,7 @@ fn config_to_waveformatextensible(
     let sub_format = match sample_format {
         SampleFormat::I16 => KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM,
         SampleFormat::F32 => Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
-        SampleFormat::U16 => return None,
+        SampleFormat::U16 | SampleFormat::I32 => return None,
     };
     let waveformatextensible = Audio::WAVEFORMATEXTENSIBLE {
         Format: waveformatex,
