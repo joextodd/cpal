@@ -44,10 +44,16 @@ pub trait HostTrait {
     /// Can be empty if the system does not support audio in general.
     fn devices(&self) -> Result<Self::Devices, DevicesError>;
 
+    #[cfg(target_os = "linux")]
+    fn default_sonos_input_device(&self) -> Option<Self::Device>;
+
     /// The default input audio device on the system.
     ///
     /// Returns `None` if no input device is available.
     fn default_input_device(&self) -> Option<Self::Device>;
+
+    #[cfg(target_os = "linux")]
+    fn default_sonos_output_device(&self) -> Option<Self::Device>;
 
     /// The default output audio device on the system.
     ///

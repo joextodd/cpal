@@ -439,12 +439,36 @@ macro_rules! impl_platform_host {
                 }
             }
 
+            #[cfg(target_os = "linux")]
+            fn default_sonos_input_device(&self) -> Option<Self::Device> {
+                match self.0 {
+                    $(
+                        $(#[cfg($feat)])?
+                        HostInner::$HostVariant(ref h) => {
+                            h.default_sonos_input_device().map(DeviceInner::$HostVariant).map(Device::from)
+                        }
+                    )*
+                }
+            }
+
             fn default_input_device(&self) -> Option<Self::Device> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
                         HostInner::$HostVariant(ref h) => {
                             h.default_input_device().map(DeviceInner::$HostVariant).map(Device::from)
+                        }
+                    )*
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            fn default_sonos_output_device(&self) -> Option<Self::Device> {
+                match self.0 {
+                    $(
+                        $(#[cfg($feat)])?
+                        HostInner::$HostVariant(ref h) => {
+                            h.default_sonos_output_device().map(DeviceInner::$HostVariant).map(Device::from)
                         }
                     )*
                 }
