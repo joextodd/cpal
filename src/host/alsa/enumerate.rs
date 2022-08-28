@@ -47,9 +47,25 @@ impl Iterator for Devices {
 }
 
 #[inline]
+pub fn default_sonos_input_device() -> Option<Device> {
+    Some(Device {
+        name: "sonos_mic_rx".to_owned(),
+        handles: Mutex::new(Default::default()),
+    })
+}
+
+#[inline]
 pub fn default_input_device() -> Option<Device> {
     Some(Device {
         name: "default".to_owned(),
+        handles: Mutex::new(Default::default()),
+    })
+}
+
+#[inline]
+pub fn default_sonos_output_device() -> Option<Device> {
+    Some(Device {
+        name: "sonos_main_tx".to_owned(),
         handles: Mutex::new(Default::default()),
     })
 }

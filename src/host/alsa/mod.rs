@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::vec::IntoIter as VecIntoIter;
 
-pub use self::enumerate::{default_input_device, default_output_device, Devices};
+pub use self::enumerate::{default_sonos_input_device, default_input_device, default_sonos_output_device, default_output_device, Devices};
 
 pub type SupportedInputConfigs = VecIntoIter<SupportedStreamConfigRange>;
 pub type SupportedOutputConfigs = VecIntoIter<SupportedStreamConfigRange>;
@@ -48,8 +48,16 @@ impl HostTrait for Host {
         Devices::new()
     }
 
+    fn default_sonos_input_device(&self) -> Option<Self::Device> {
+        default_sonos_input_device()
+    }
+
     fn default_input_device(&self) -> Option<Self::Device> {
         default_input_device()
+    }
+
+    fn default_sonos_output_device(&self) -> Option<Self::Device> {
+        default_sonos_output_device()
     }
 
     fn default_output_device(&self) -> Option<Self::Device> {

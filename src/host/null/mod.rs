@@ -109,7 +109,17 @@ impl HostTrait for Host {
         Devices::new()
     }
 
+    #[cfg(target_os = "linux")]
+    fn default_sonos_input_device(&self) -> Option<Device> {
+        None
+    }
+
     fn default_input_device(&self) -> Option<Device> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn default_sonos_output_device(&self) -> Option<Device> {
         None
     }
 

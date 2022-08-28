@@ -123,12 +123,6 @@ unsafe impl Sample for f32 {
 
     /// This function inherently returns a lossy value due to scaling.
     #[inline]
-    fn to_u16(&self) -> u16 {
-        (((*self + 1.0) * 0.5) * ::std::u16::MAX as f32).round() as u16
-    }
-
-    /// This function inherently returns a lossy value due to scaling.
-    #[inline]
     fn to_i16(&self) -> i16 {
         if *self >= 0.0 {
             (*self * i16::MAX as f32) as i16
@@ -138,6 +132,7 @@ unsafe impl Sample for f32 {
     }
 
     /// This function inherently returns a lossy value due to scaling.
+    #[inline]
     fn to_u16(&self) -> u16 {
         self.mul_add(F32_TO_16BIT_INT_MULTIPLIER, F32_TO_16BIT_INT_MULTIPLIER)
             .round() as u16
