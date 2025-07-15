@@ -1,25 +1,7 @@
-extern crate core_foundation_sys;
-extern crate coreaudio;
-
+#![allow(deprecated)]
 use super::{asbd_from_config, check_os_status, frames_to_duration, host_time_to_stream_instant};
 
-use self::core_foundation_sys::string::{CFStringGetCString, CFStringGetCStringPtr, CFStringRef};
-use self::coreaudio::audio_unit::render_callback::{self, data};
-use self::coreaudio::audio_unit::{AudioUnit, Element, Scope};
-use self::coreaudio::sys::{
-    kAudioDevicePropertyAvailableNominalSampleRates, kAudioDevicePropertyBufferFrameSize,
-    kAudioDevicePropertyBufferFrameSizeRange, kAudioDevicePropertyDeviceIsAlive,
-    kAudioDevicePropertyDeviceNameCFString, kAudioDevicePropertyNominalSampleRate,
-    kAudioDevicePropertyScopeOutput, kAudioDevicePropertyStreamConfiguration,
-    kAudioDevicePropertyStreamFormat, kAudioObjectPropertyElementMaster,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
-    kAudioObjectPropertyScopeOutput, kAudioOutputUnitProperty_CurrentDevice,
-    kAudioOutputUnitProperty_EnableIO, kAudioUnitProperty_StreamFormat, kCFStringEncodingUTF8,
-    AudioBuffer, AudioBufferList, AudioDeviceID, AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectPropertyScope, AudioObjectSetPropertyData, AudioStreamBasicDescription,
-    AudioValueRange, OSStatus,
-};
+use super::OSStatus;
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
     BackendSpecificError, BufferSize, BuildStreamError, ChannelCount, Data,
@@ -28,15 +10,31 @@ use crate::{
     SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
     SupportedStreamConfigsError,
 };
-use parking_lot::Mutex;
-use std::ffi::CStr;
+use coreaudio::audio_unit::render_callback::{self, data};
+use coreaudio::audio_unit::{AudioUnit, Element, Scope};
+use objc2_audio_toolbox::{
+    kAudioOutputUnitProperty_CurrentDevice, kAudioOutputUnitProperty_EnableIO,
+    kAudioUnitProperty_StreamFormat,
+};
+use objc2_core_audio::{
+    kAudioDevicePropertyAvailableNominalSampleRates, kAudioDevicePropertyBufferFrameSize,
+    kAudioDevicePropertyBufferFrameSizeRange, kAudioDevicePropertyDeviceIsAlive,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
+    kAudioDevicePropertyStreamFormat, kAudioObjectPropertyElementMaster,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, AudioDeviceID, AudioObjectGetPropertyData,
+    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
+    AudioObjectPropertyScope, AudioObjectSetPropertyData,
+};
+use objc2_core_audio_types::{
+    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioValueRange,
+};
 use std::fmt;
 use std::mem;
-use std::os::raw::c_char;
-use std::ptr::null;
+use std::ptr::{null, NonNull};
 use std::slice;
 use std::sync::mpsc::{channel, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub use self::enumerate::{
@@ -44,6 +42,7 @@ pub use self::enumerate::{
     SupportedOutputConfigs,
 };
 
+use coreaudio::audio_unit::macos_helpers::get_device_name;
 use property_listener::AudioObjectPropertyListener;
 
 pub mod enumerate;
@@ -162,55 +161,21 @@ pub struct Device {
 }
 
 impl Device {
-    fn name(&self) -> Result<String, DeviceNameError> {
-        let property_address = AudioObjectPropertyAddress {
-            mSelector: kAudioDevicePropertyDeviceNameCFString,
-            mScope: kAudioDevicePropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMaster,
-        };
-        let device_name: CFStringRef = null();
-        let data_size = mem::size_of::<CFStringRef>();
-        let c_str = unsafe {
-            let status = AudioObjectGetPropertyData(
-                self.audio_device_id,
-                &property_address as *const _,
-                0,
-                null(),
-                &data_size as *const _ as *mut _,
-                &device_name as *const _ as *mut _,
-            );
-            check_os_status(status)?;
+    /// Construct a new device given its ID.
+    /// Useful for constructing hidden devices.
+    pub fn new(audio_device_id: AudioDeviceID) -> Self {
+        Device {
+            audio_device_id,
+            is_default: audio_device_id < 0,
+        }
+    }
 
-            let c_string: *const c_char = CFStringGetCStringPtr(device_name, kCFStringEncodingUTF8);
-            if c_string.is_null() {
-                let status = AudioObjectGetPropertyData(
-                    self.audio_device_id,
-                    &property_address as *const _,
-                    0,
-                    null(),
-                    &data_size as *const _ as *mut _,
-                    &device_name as *const _ as *mut _,
-                );
-                check_os_status(status)?;
-                let mut buf: [i8; 255] = [0; 255];
-                let result = CFStringGetCString(
-                    device_name,
-                    buf.as_mut_ptr(),
-                    buf.len() as _,
-                    kCFStringEncodingUTF8,
-                );
-                if result == 0 {
-                    let description =
-                        "core foundation failed to return device name string".to_string();
-                    let err = BackendSpecificError { description };
-                    return Err(err.into());
-                }
-                let name: &CStr = CStr::from_ptr(buf.as_ptr());
-                return Ok(name.to_str().unwrap().to_owned());
-            }
-            CStr::from_ptr(c_string as *mut _)
-        };
-        Ok(c_str.to_string_lossy().into_owned())
+    fn name(&self) -> Result<String, DeviceNameError> {
+        get_device_name(self.audio_device_id).map_err(|err| DeviceNameError::BackendSpecific {
+            err: BackendSpecificError {
+                description: err.to_string(),
+            },
+        })
     }
 
     // Logic re-used between `supported_input_configs` and `supported_output_configs`.
@@ -230,10 +195,10 @@ impl Device {
             let data_size = 0u32;
             let status = AudioObjectGetPropertyDataSize(
                 self.audio_device_id,
-                &property_address as *const _,
+                NonNull::from(&property_address),
                 0,
                 null(),
-                &data_size as *const _ as *mut _,
+                NonNull::from(&data_size),
             );
             check_os_status(status)?;
 
@@ -241,11 +206,11 @@ impl Device {
             audio_buffer_list.reserve_exact(data_size as usize);
             let status = AudioObjectGetPropertyData(
                 self.audio_device_id,
-                &property_address as *const _,
+                NonNull::from(&property_address),
                 0,
                 null(),
-                &data_size as *const _ as *mut _,
-                audio_buffer_list.as_mut_ptr() as *mut _,
+                NonNull::from(&data_size),
+                NonNull::new(audio_buffer_list.as_mut_ptr()).unwrap().cast(),
             );
             check_os_status(status)?;
 
@@ -274,10 +239,10 @@ impl Device {
             let data_size = 0u32;
             let status = AudioObjectGetPropertyDataSize(
                 self.audio_device_id,
-                &property_address as *const _,
+                NonNull::from(&property_address),
                 0,
                 null(),
-                &data_size as *const _ as *mut _,
+                NonNull::from(&data_size),
             );
             check_os_status(status)?;
 
@@ -286,18 +251,29 @@ impl Device {
             ranges.reserve_exact(data_size as usize);
             let status = AudioObjectGetPropertyData(
                 self.audio_device_id,
-                &property_address as *const _,
+                NonNull::from(&property_address),
                 0,
                 null(),
-                &data_size as *const _ as *mut _,
-                ranges.as_mut_ptr() as *mut _,
+                NonNull::from(&data_size),
+                NonNull::new(ranges.as_mut_ptr()).unwrap().cast(),
             );
             check_os_status(status)?;
 
             let ranges: *mut AudioValueRange = ranges.as_mut_ptr() as *mut _;
             let ranges: &'static [AudioValueRange] = slice::from_raw_parts(ranges, n_ranges);
 
-            let audio_unit = audio_unit_from_device(self, true)?;
+            #[allow(non_upper_case_globals)]
+            let input = match scope {
+                kAudioObjectPropertyScopeInput => Ok(true),
+                kAudioObjectPropertyScopeOutput => Ok(false),
+                _ => Err(BackendSpecificError {
+                    description: format!(
+                        "unexpected scope (neither input nor output): {:?}",
+                        scope
+                    ),
+                }),
+            }?;
+            let audio_unit = audio_unit_from_device(self, input)?;
             let buffer_size = get_io_buffer_frame_size_range(&audio_unit)?;
 
             // Collect the supported formats for the device.
@@ -307,7 +283,7 @@ impl Device {
                     channels: n_channels as ChannelCount,
                     min_sample_rate: SampleRate(range.mMinimum as _),
                     max_sample_rate: SampleRate(range.mMaximum as _),
-                    buffer_size: buffer_size.clone(),
+                    buffer_size,
                     sample_format,
                 };
                 fmts.push(fmt);
@@ -366,15 +342,15 @@ impl Device {
         };
 
         unsafe {
-            let asbd: AudioStreamBasicDescription = mem::zeroed();
+            let mut asbd: AudioStreamBasicDescription = mem::zeroed();
             let data_size = mem::size_of::<AudioStreamBasicDescription>() as u32;
             let status = AudioObjectGetPropertyData(
                 self.audio_device_id,
-                &property_address as *const _,
+                NonNull::from(&property_address),
                 0,
                 null(),
-                &data_size as *const _ as *mut _,
-                &asbd as *const _ as *mut _,
+                NonNull::from(&data_size),
+                NonNull::from(&mut asbd).cast(),
             );
             default_config_error_from_os_status(status)?;
 
@@ -399,7 +375,18 @@ impl Device {
                 }
             };
 
-            let audio_unit = audio_unit_from_device(self, true)?;
+            #[allow(non_upper_case_globals)]
+            let input = match scope {
+                kAudioObjectPropertyScopeInput => Ok(true),
+                kAudioObjectPropertyScopeOutput => Ok(false),
+                _ => Err(BackendSpecificError {
+                    description: format!(
+                        "unexpected scope (neither input nor output): {:?}",
+                        scope
+                    ),
+                }),
+            }?;
+            let audio_unit = audio_unit_from_device(self, input)?;
             let buffer_size = get_io_buffer_frame_size_range(&audio_unit)?;
 
             let config = SupportedStreamConfig {
@@ -443,6 +430,32 @@ struct StreamInner {
     device_id: AudioDeviceID,
 }
 
+impl StreamInner {
+    fn play(&mut self) -> Result<(), PlayStreamError> {
+        if !self.playing {
+            if let Err(e) = self.audio_unit.start() {
+                let description = format!("{}", e);
+                let err = BackendSpecificError { description };
+                return Err(err.into());
+            }
+            self.playing = true;
+        }
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), PauseStreamError> {
+        if self.playing {
+            if let Err(e) = self.audio_unit.stop() {
+                let description = format!("{}", e);
+                let err = BackendSpecificError { description };
+                return Err(err.into());
+            }
+            self.playing = false;
+        }
+        Ok(())
+    }
+}
+
 /// Register the on-disconnect callback.
 /// This will both stop the stream and call the error callback with DeviceNotAvailable.
 /// This function should only be called once per stream.
@@ -453,8 +466,8 @@ fn add_disconnect_listener<E>(
 where
     E: FnMut(StreamError) + Send + 'static,
 {
-    let stream_copy = stream.clone();
-    let mut stream_inner = stream.inner.lock();
+    let stream_inner_weak = Arc::downgrade(&stream.inner);
+    let mut stream_inner = stream.inner.lock().unwrap();
     stream_inner._disconnect_listener = Some(AudioObjectPropertyListener::new(
         stream_inner.device_id,
         AudioObjectPropertyAddress {
@@ -463,8 +476,11 @@ where
             mElement: kAudioObjectPropertyElementMaster,
         },
         move || {
-            let _ = stream_copy.pause();
-            (error_callback.lock())(StreamError::DeviceNotAvailable);
+            if let Some(stream_inner_strong) = stream_inner_weak.upgrade() {
+                let mut stream_inner = stream_inner_strong.lock().unwrap();
+                let _ = stream_inner.pause();
+                (error_callback.lock().unwrap())(StreamError::DeviceNotAvailable);
+            }
         },
     )?);
     Ok(())
@@ -569,7 +585,7 @@ impl Device {
         let sample_rate = config.sample_rate;
         type Args = render_callback::Args<data::Raw>;
         audio_unit.set_input_callback(move |args: Args| unsafe {
-            let ptr = (*args.data.data).mBuffers.as_ptr() as *const AudioBuffer;
+            let ptr = (*args.data.data).mBuffers.as_ptr();
             let len = (*args.data.data).mNumberBuffers as usize;
             let buffers: &[AudioBuffer] = slice::from_raw_parts(ptr, len);
 
@@ -581,13 +597,13 @@ impl Device {
             } = buffers[0];
 
             let data = data as *mut ();
-            let len = (data_byte_size as usize / bytes_per_channel) as usize;
+            let len = data_byte_size as usize / bytes_per_channel;
             let data = Data::from_parts(data, len, sample_format);
 
             // TODO: Need a better way to get delay, for now we assume a double-buffer offset.
             let callback = match host_time_to_stream_instant(args.time_stamp.mHostTime) {
                 Err(err) => {
-                    (error_callback.lock())(err.into());
+                    (error_callback.lock().unwrap())(err.into());
                     return Err(());
                 }
                 Ok(cb) => cb,
@@ -617,7 +633,7 @@ impl Device {
             add_disconnect_listener(&stream, error_callback_disconnect)?;
         }
 
-        stream.inner.lock().audio_unit.start()?;
+        stream.inner.lock().unwrap().audio_unit.start()?;
 
         Ok(stream)
     }
@@ -686,12 +702,12 @@ impl Device {
             } = (*args.data.data).mBuffers[0];
 
             let data = data as *mut ();
-            let len = (data_byte_size as usize / bytes_per_channel) as usize;
+            let len = data_byte_size as usize / bytes_per_channel;
             let mut data = Data::from_parts(data, len, sample_format);
 
             let callback = match host_time_to_stream_instant(args.time_stamp.mHostTime) {
                 Err(err) => {
-                    (error_callback.lock())(err.into());
+                    (error_callback.lock().unwrap())(err.into());
                     return Err(());
                 }
                 Ok(cb) => cb,
@@ -722,7 +738,7 @@ impl Device {
             add_disconnect_listener(&stream, error_callback_disconnect)?;
         }
 
-        stream.inner.lock().audio_unit.start()?;
+        stream.inner.lock().unwrap().audio_unit.start()?;
 
         Ok(stream)
     }
@@ -740,16 +756,16 @@ fn set_sample_rate(
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMaster,
     };
-    let sample_rate: f64 = 0.0;
+    let mut sample_rate: f64 = 0.0;
     let data_size = mem::size_of::<f64>() as u32;
     let status = unsafe {
         AudioObjectGetPropertyData(
             audio_device_id,
-            &property_address as *const _,
+            NonNull::from(&property_address),
             0,
             null(),
-            &data_size as *const _ as *mut _,
-            &sample_rate as *const _ as *mut _,
+            NonNull::from(&data_size),
+            NonNull::from(&mut sample_rate).cast(),
         )
     };
     coreaudio::Error::from_os_status(status)?;
@@ -762,10 +778,10 @@ fn set_sample_rate(
         let status = unsafe {
             AudioObjectGetPropertyDataSize(
                 audio_device_id,
-                &property_address as *const _,
+                NonNull::from(&property_address),
                 0,
                 null(),
-                &data_size as *const _ as *mut _,
+                NonNull::from(&data_size),
             )
         };
         coreaudio::Error::from_os_status(status)?;
@@ -775,11 +791,11 @@ fn set_sample_rate(
         let status = unsafe {
             AudioObjectGetPropertyData(
                 audio_device_id,
-                &property_address as *const _,
+                NonNull::from(&property_address),
                 0,
                 null(),
-                &data_size as *const _ as *mut _,
-                ranges.as_mut_ptr() as *mut _,
+                NonNull::from(&data_size),
+                NonNull::new(ranges.as_mut_ptr()).unwrap().cast(),
             )
         };
         coreaudio::Error::from_os_status(status)?;
@@ -805,16 +821,16 @@ fn set_sample_rate(
         // Send sample rate updates back on a channel.
         let sample_rate_handler = move || {
             let mut rate: f64 = 0.0;
-            let data_size = mem::size_of::<f64>();
+            let data_size = mem::size_of::<f64>() as u32;
 
             let result = unsafe {
                 AudioObjectGetPropertyData(
                     audio_device_id,
-                    &sample_rate_address as *const _,
+                    NonNull::from(&sample_rate_address),
                     0,
                     null(),
-                    &data_size as *const _ as *mut _,
-                    &mut rate as *const _ as *mut _,
+                    NonNull::from(&data_size),
+                    NonNull::from(&mut rate).cast(),
                 )
             };
             send.send(coreaudio::Error::from_os_status(result).map(|_| rate))
@@ -832,11 +848,11 @@ fn set_sample_rate(
         let status = unsafe {
             AudioObjectSetPropertyData(
                 audio_device_id,
-                &property_address as *const _,
+                NonNull::from(&property_address),
                 0,
                 null(),
                 data_size,
-                &ranges[range_index] as *const _ as *const _,
+                NonNull::from(&ranges[range_index]).cast(),
             )
         };
         coreaudio::Error::from_os_status(status)?;
@@ -896,32 +912,15 @@ impl Stream {
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
-        let mut stream = self.inner.lock();
+        let mut stream = self.inner.lock().unwrap();
 
-        if !stream.playing {
-            if let Err(e) = stream.audio_unit.start() {
-                let description = format!("{}", e);
-                let err = BackendSpecificError { description };
-                return Err(err.into());
-            }
-            stream.playing = true;
-        }
-        Ok(())
+        stream.play()
     }
 
     fn pause(&self) -> Result<(), PauseStreamError> {
-        let mut stream = self.inner.lock();
+        let mut stream = self.inner.lock().unwrap();
 
-        if stream.playing {
-            if let Err(e) = stream.audio_unit.stop() {
-                let description = format!("{}", e);
-                let err = BackendSpecificError { description };
-                return Err(err.into());
-            }
-
-            stream.playing = false;
-        }
-        Ok(())
+        stream.pause()
     }
 }
 

@@ -1,9 +1,7 @@
 extern crate alsa;
 extern crate libc;
-extern crate parking_lot;
 
 use self::alsa::poll::Descriptors;
-use self::parking_lot::Mutex;
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
     BackendSpecificError, BufferSize, BuildStreamError, ChannelCount, Data,
@@ -12,9 +10,10 @@ use crate::{
     SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
     SupportedStreamConfigsError,
 };
+use std::cell::Cell;
 use std::cmp;
 use std::convert::TryInto;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::vec::IntoIter as VecIntoIter;
@@ -195,10 +194,10 @@ struct DeviceHandles {
 impl DeviceHandles {
     /// Create `DeviceHandles` for `name` and try to open a handle for both
     /// directions. Returns `Ok` if either direction is opened successfully.
-    fn open(name: &str) -> Result<Self, alsa::Error> {
+    fn open(pcm_id: &str) -> Result<Self, alsa::Error> {
         let mut handles = Self::default();
-        let playback_err = handles.try_open(name, alsa::Direction::Playback).err();
-        let capture_err = handles.try_open(name, alsa::Direction::Capture).err();
+        let playback_err = handles.try_open(pcm_id, alsa::Direction::Playback).err();
+        let capture_err = handles.try_open(pcm_id, alsa::Direction::Capture).err();
         if let Some(err) = capture_err.and(playback_err) {
             Err(err)
         } else {
@@ -212,7 +211,7 @@ impl DeviceHandles {
     /// `Option` is guaranteed to be `Some(..)`.
     fn try_open(
         &mut self,
-        name: &str,
+        pcm_id: &str,
         stream_type: alsa::Direction,
     ) -> Result<&mut Option<alsa::PCM>, alsa::Error> {
         let handle = match stream_type {
@@ -221,7 +220,7 @@ impl DeviceHandles {
         };
 
         if handle.is_none() {
-            *handle = Some(alsa::pcm::PCM::new(name, stream_type, true)?);
+            *handle = Some(alsa::pcm::PCM::new(pcm_id, stream_type, true)?);
         }
 
         Ok(handle)
@@ -231,10 +230,10 @@ impl DeviceHandles {
     /// If the handle is not yet opened, it will be opened and stored in `self`.
     fn get_mut(
         &mut self,
-        name: &str,
+        pcm_id: &str,
         stream_type: alsa::Direction,
     ) -> Result<&mut alsa::PCM, alsa::Error> {
-        Ok(self.try_open(name, stream_type)?.as_mut().unwrap())
+        Ok(self.try_open(pcm_id, stream_type)?.as_mut().unwrap())
     }
 
     /// Take ownership of the `alsa::PCM` handle for a specific `stream_type`.
@@ -244,9 +243,11 @@ impl DeviceHandles {
     }
 }
 
+#[derive(Clone)]
 pub struct Device {
     name: String,
-    handles: Mutex<DeviceHandles>,
+    pcm_id: String,
+    handles: Arc<Mutex<DeviceHandles>>,
 }
 
 impl Device {
@@ -259,16 +260,13 @@ impl Device {
         let handle_result = self
             .handles
             .lock()
-            .take(&self.name, stream_type)
+            .unwrap()
+            .take(&self.pcm_id, stream_type)
             .map_err(|e| (e, e.errno()));
 
         let handle = match handle_result {
-            Err((_, alsa::nix::errno::Errno::EBUSY)) => {
-                return Err(BuildStreamError::DeviceNotAvailable)
-            }
-            Err((_, alsa::nix::errno::Errno::EINVAL)) => {
-                return Err(BuildStreamError::InvalidArgument)
-            }
+            Err((_, libc::EBUSY)) => return Err(BuildStreamError::DeviceNotAvailable),
+            Err((_, libc::EINVAL)) => return Err(BuildStreamError::InvalidArgument),
             Err((e, _)) => return Err(e.into()),
             Ok(handle) => handle,
         };
@@ -297,6 +295,7 @@ impl Device {
         }
 
         let stream_inner = StreamInner {
+            dropping: Cell::new(false),
             channel: handle,
             sample_format,
             num_descriptors,
@@ -318,19 +317,16 @@ impl Device {
         &self,
         stream_t: alsa::Direction,
     ) -> Result<VecIntoIter<SupportedStreamConfigRange>, SupportedStreamConfigsError> {
-        let mut guard = self.handles.lock();
+        let mut guard = self.handles.lock().unwrap();
         let handle_result = guard
-            .get_mut(&self.name, stream_t)
+            .get_mut(&self.pcm_id, stream_t)
             .map_err(|e| (e, e.errno()));
 
         let handle = match handle_result {
-            Err((_, alsa::nix::errno::Errno::ENOENT))
-            | Err((_, alsa::nix::errno::Errno::EBUSY)) => {
+            Err((_, libc::ENOENT)) | Err((_, libc::EBUSY)) => {
                 return Err(SupportedStreamConfigsError::DeviceNotAvailable)
             }
-            Err((_, alsa::nix::errno::Errno::EINVAL)) => {
-                return Err(SupportedStreamConfigsError::InvalidArgument)
-            }
+            Err((_, libc::EINVAL)) => return Err(SupportedStreamConfigsError::InvalidArgument),
             Err((e, _)) => return Err(e.into()),
             Ok(handle) => handle,
         };
@@ -441,9 +437,9 @@ impl Device {
                 for &(min_rate, max_rate) in sample_rates.iter() {
                     output.push(SupportedStreamConfigRange {
                         channels,
-                        min_sample_rate: SampleRate(min_rate as u32),
-                        max_sample_rate: SampleRate(max_rate as u32),
-                        buffer_size: buffer_size_range.clone(),
+                        min_sample_rate: SampleRate(min_rate),
+                        max_sample_rate: SampleRate(max_rate),
+                        buffer_size: buffer_size_range,
                         sample_format,
                     });
                 }
@@ -490,7 +486,7 @@ impl Device {
 
         formats.sort_by(|a, b| a.cmp_default_heuristics(b));
 
-        match formats.into_iter().last() {
+        match formats.into_iter().next_back() {
             Some(f) => {
                 let min_r = f.min_sample_rate;
                 let max_r = f.max_sample_rate;
@@ -515,6 +511,10 @@ impl Device {
 }
 
 struct StreamInner {
+    // Flag used to check when to stop polling, regardless of the state of the stream
+    // (e.g. broken due to a disconnected device).
+    dropping: Cell<bool>,
+
     // The ALSA channel.
     channel: alsa::pcm::PCM,
 
@@ -597,6 +597,8 @@ fn input_stream_worker(
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
     timeout: Option<Duration>,
 ) {
+    boost_current_thread_priority(stream.conf.buffer_size, stream.conf.sample_rate);
+
     let mut ctxt = StreamWorkerContext::new(&timeout);
     loop {
         let flow =
@@ -648,6 +650,8 @@ fn output_stream_worker(
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
     timeout: Option<Duration>,
 ) {
+    boost_current_thread_priority(stream.conf.buffer_size, stream.conf.sample_rate);
+
     let mut ctxt = StreamWorkerContext::new(&timeout);
     loop {
         let flow =
@@ -692,6 +696,25 @@ fn output_stream_worker(
     }
 }
 
+#[cfg(feature = "audio_thread_priority")]
+fn boost_current_thread_priority(buffer_size: BufferSize, sample_rate: SampleRate) {
+    use audio_thread_priority::promote_current_thread_to_real_time;
+
+    let buffer_size = if let BufferSize::Fixed(buffer_size) = buffer_size {
+        buffer_size
+    } else {
+        // if the buffer size isn't fixed, let audio_thread_priority choose a sensible default value
+        0
+    };
+
+    if let Err(err) = promote_current_thread_to_real_time(buffer_size, sample_rate.0) {
+        eprintln!("Failed to promote audio thread to real-time priority: {err}");
+    }
+}
+
+#[cfg(not(feature = "audio_thread_priority"))]
+fn boost_current_thread_priority(_: BufferSize, _: SampleRate) {}
+
 enum PollDescriptorsFlow {
     Continue,
     Return,
@@ -710,6 +733,12 @@ fn poll_descriptors_and_prepare_buffer(
     stream: &StreamInner,
     ctxt: &mut StreamWorkerContext,
 ) -> Result<PollDescriptorsFlow, BackendSpecificError> {
+    if stream.dropping.get() {
+        // The stream has been requested to be destroyed.
+        rx.clear_pipe();
+        return Ok(PollDescriptorsFlow::Return);
+    }
+
     let StreamWorkerContext {
         ref mut descriptors,
         ref mut buffer,
@@ -751,7 +780,12 @@ fn poll_descriptors_and_prepare_buffer(
         return Ok(PollDescriptorsFlow::Return);
     }
 
-    let stream_type = match stream.channel.revents(&descriptors[1..])? {
+    let revents = stream.channel.revents(&descriptors[1..])?;
+    if revents.contains(alsa::poll::Flags::ERR) {
+        let description = String::from("`alsa::poll()` returned POLLERR");
+        return Err(BackendSpecificError { description });
+    }
+    let stream_type = match revents {
         alsa::poll::Flags::OUT => StreamType::Output,
         alsa::poll::Flags::IN => StreamType::Input,
         _ => {
@@ -762,9 +796,7 @@ fn poll_descriptors_and_prepare_buffer(
 
     let status = stream.channel.status()?;
     let avail_frames = match stream.channel.avail() {
-        Err(err) if err.errno() == alsa::nix::errno::Errno::EPIPE => {
-            return Ok(PollDescriptorsFlow::XRun)
-        }
+        Err(err) if err.errno() == libc::EPIPE => return Ok(PollDescriptorsFlow::XRun),
         res => res,
     }? as usize;
     let delay_frames = match status.get_delay() {
@@ -845,10 +877,16 @@ fn process_output(
     }
     loop {
         match stream.channel.io_bytes().writei(buffer) {
-            Err(err) if err.errno() == alsa::nix::errno::Errno::EPIPE => {
-                // buffer underrun
-                // TODO: Notify the user of this.
-                let _ = stream.channel.try_recover(err, false);
+            Err(err) if err.errno() == libc::EPIPE => {
+                // ALSA underrun or overrun.
+                // See https://github.com/alsa-project/alsa-lib/blob/b154d9145f0e17b9650e4584ddfdf14580b4e0d7/src/pcm/pcm.c#L8767-L8770
+                // Even if these recover successfully, they still may cause audible glitches.
+
+                // TODO:
+                //   Should we notify the user about successfully recovered errors?
+                //   Should we notify the user about failures in try_recover, rather than ignoring them?
+                //   (Both potentially not real-time-safe)
+                _ = stream.channel.try_recover(err, true);
             }
             Err(err) => {
                 error_callback(err.into());
@@ -884,19 +922,23 @@ fn stream_timestamp(
             let ts = status.get_htstamp();
             let nanos = timespec_diff_nanos(ts, trigger_ts);
             if nanos < 0 {
-                panic!(
-                    "get_htstamp `{:?}` was earlier than get_trigger_htstamp `{:?}`",
-                    ts, trigger_ts
+                let description = format!(
+                    "get_htstamp `{}.{}` was earlier than get_trigger_htstamp `{}.{}`",
+                    ts.tv_sec, ts.tv_nsec, trigger_ts.tv_sec, trigger_ts.tv_nsec
                 );
+                return Err(BackendSpecificError { description });
             }
             Ok(crate::StreamInstant::from_nanos(nanos))
         }
         Some(creation) => {
             let now = std::time::Instant::now();
             let duration = now.duration_since(creation);
-            let instant = crate::StreamInstant::from_nanos_i128(duration.as_nanos() as i128)
-                .expect("stream duration has exceeded `StreamInstant` representation");
-            Ok(instant)
+            crate::StreamInstant::from_nanos_i128(duration.as_nanos() as i128).ok_or(
+                BackendSpecificError {
+                    description: "stream duration has exceeded `StreamInstant` representation"
+                        .to_string(),
+                },
+            )
         }
     }
 }
@@ -989,6 +1031,7 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        self.inner.dropping.set(true);
         self.trigger.wakeup();
         self.thread.take().unwrap().join().unwrap();
     }
